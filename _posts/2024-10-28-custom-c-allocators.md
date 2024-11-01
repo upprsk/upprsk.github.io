@@ -34,7 +34,7 @@ the deciding factor.
 
 But then are we going back to `malloc` and `free`? Of course not, there are much
 better ways to handle allocation, depending on when and how you intend to use the
-memory. This is the realm of _custom build allocators_.
+memory. This is the realm of _custom-built allocators_.
 
 ## Linear allocators
 
@@ -132,9 +132,9 @@ the accessed memory needs to be aligned to its integer size.
 But what does that mean?
 
 When the processor requests to read or write an integer of some size, the address
-where it is placed needs to be a multiple of its size. So a 4 byte integer can only
-be loaded or stored in an address that is a multiple of 4, a 2 byte integer can only
-be loaded or stored in an even address, and so on and so forth.
+of where it is placed needs to be a multiple of its size. So a 4 byte integer can
+only be loaded or stored in an address that is a multiple of 4, a 2 byte integer
+can only be loaded or stored in an even address, and so on and so forth.
 
 ![Memory alignment](/assets/images/memory_alignment.jpg){: style="width: 50%;"}
 
@@ -320,3 +320,199 @@ usage (like in an embedded device) this is excellent, but it is not very good in
 a more general use case. This is where a more advanced linear allocator is required.
 
 ## Arena Allocators
+
+We want the speed and ease of use of the FBA, but also not worry about what the
+peak usage will be. This can be solved by moving the buffer management inside the
+allocator itself.
+
+The first big change in the implementation comes from the fact that our backing
+buffers need to be allocated dynamically, and that raises the question: how to
+allocate them? This introduces another concept that is usually present when
+custom allocators are at play: nested allocators.
+
+The arena allocator needs a backing allocator to allocate more space from, and it
+can be any kind of allocator (although some algorithms will obviously perform
+better than others). For now, we will simply use `malloc` to keep the examples simple.
+
+So let's begin with the types:
+
+```c
+typedef struct arena_block {
+  struct arena_block *next;
+  uint8_t *buffer_end;
+  uint8_t *head;
+  uint8_t buffer[];
+} arena_block_t;
+
+typedef struct arena {
+  arena_block_t *blocks;
+} arena_t;
+```
+
+There are now two data types at play: the main state `arena_t` that the public
+API will interact with and the state for each live allocation block
+(`arena_block_t`). Now wait a minute! What is a block?
+
+![Arena](/assets/images/arena_1.jpg){: style="width: 50%;"}
+
+A block is basically an FBA in a linked-list. Whenever there is a request to
+allocate memory, we use the first block in the list to allocate it. If it is
+already full, then allocate a new block, prepend it to the list and use the new
+one going forward. In the end, when the time to free all the memory arrives,
+we walk the linked-list freeing each of the blocks.
+
+But what about the weird `uint8_t buffer[]` member in the block? And what about
+how the buffer intersects the struct in the example image?
+
+Well, that is a special C trick called _flexible array member_, and it allows us
+to reference memory past the end of the struct. Think about the memory layout of
+the `arena_block_t` struct:
+
+![Arena block layout](/assets/images/arena_block.jpg)
+
+We see the three pointers of our struct: `next`, `buffer_end` and `head`. They
+represent the real size of or struct, 24 bytes on a 64bit architecture. The
+`buffer[]` field is compiler magic to point to the first byte after these 24.
+
+This will probably make more sense with some code:
+
+```c
+#define ARENA_BLOCK_SIZE 1024
+
+static inline void arena_block_init(arena_block_t *b, arena_block_t *next) {
+  b->next = next;
+
+  // the end of the buffer is the size of the allocation. Another way to write this
+  // would be:
+  //  b->buffer_end = b->buffer - sizeof(arena_block_t) + ARENA_BLOCK_SIZE;
+  b->buffer_end = ((uint8_t *)b) + ARENA_BLOCK_SIZE;
+  b->head = b->buffer;
+}
+
+static arena_block_t *arena_new_block(arena_t *a) {
+  arena_block_t *blk = malloc(ARENA_BLOCK_SIZE);
+  if (!blk) return NULL;
+
+  // initialize the block and prepend to the linked list
+  arena_block_init(blk, a->blocks);
+  a->blocks = blk;
+
+  return blk;
+}
+```
+
+The block is allocated to the full size (1 KiB in this case), and not the size of
+the struct. This matches the behavior explained above, the buffer is the memory
+right after the struct. This also means that the space actually available for
+allocation is 1000 bytes and not 1024, because of `arena_block_t` at the start
+of the memory region.
+
+Now moving on to the rest of the implementation:
+
+```c
+// exaclty the same as fba_alloc_opt
+static void *arena_block_alloc(arena_block_t *b, size_t size, size_t align) {
+  // get the head, aligned correctly and check if we have enough space
+  uint8_t *head = (uint8_t *)ALIGN_TO((uintptr_t)b->head, align);
+  if (head + size > b->buffer_end) {
+    return NULL;
+  }
+
+  // move the head forward and return
+  b->head = head + size;
+
+  return head;
+}
+
+static arena_block_t *arena_get_block(arena_t *a) {
+  if (a->blocks)
+    return a->blocks;
+
+  // allocate the first block in the list
+  return arena_new_block(a);
+}
+
+static void *arena_alloc(arena_t *a, size_t size, size_t align) {
+  arena_block_t *blk = arena_get_block(a);
+  if (!blk)
+    return NULL;
+
+  void *buf = arena_block_alloc(blk, size, align);
+  if (buf)
+    return buf;
+
+  blk = arena_new_block(a);
+  return arena_block_alloc(blk, size, align);
+}
+
+static void arena_clear(arena_t *a) {
+  arena_block_t *b = a->blocks;
+  while (b) {
+    arena_block_t *next = b->next;
+    free(b);
+    b = next;
+  }
+
+  a->blocks = NULL;
+}
+```
+
+This is quite a bit more code than the previous one. It is, however, quite simple.
+Considering the following usage code:
+
+```c
+int main(void) {
+  arena_t arena = {};
+
+  // 1
+  int *things = arena_alloc(&arena, sizeof(*things), _Alignof(*things));
+
+  // 2
+  things = arena_alloc(&arena, sizeof(*things) * 4, _Alignof(*things));
+
+  // 3
+  char *big = arena_alloc(&arena, 990, _Alignof(*big));
+
+  arena_clear(&arena);
+
+  return EXIT_SUCCESS;
+}
+```
+
+The following sequence will take place for the first allocation:
+
+- `arena_alloc` is called, it calls `arena_get_block`.
+- `arena_get_block` check if `blocks` has items, it does not, so it calls `arena_new_block`.
+- `arena_new_block` allocates a memory region with size `ARENA_BLOCK_SIZE` and initializes
+  it. In the initialization we set the `next` field to the current start of the
+  list (which is `NULL`), the `buffer_end` to the end of the allocated region and
+  `head` to the start of the buffer. Finally, we set the `blocks` to the new block.
+- Back in `arena_alloc`, we use the returned block to allocate with `size` and
+  `align`.
+- `arena_block_alloc` is identical to `fba_alloc`, and will succeed in this case
+ (as the block is empty).
+
+After the first allocation the state of our allocator is:
+
+- `blocks` is a linked-list with a single block in it.
+- The single block in our list has `sizeof(int)` allocated in it.
+
+In the second allocation:
+
+- `arena_alloc` calls `arena_get_block`, and as we have a block allocated, it
+  returns it.
+- `arena_block_alloc` succeeds, and we now have `sizeof(int) * 5` allocated in it.
+
+In the third allocation:
+
+- `arena_alloc` calls `arena_get_block`, and as we have a block allocated, it
+  returns it.
+- `arena_block_alloc` fails, so we allocate a new empty block and make it the
+  head of our linked list. We then try to allocate from the new block, which
+  succeeds.
+
+This shows that when there is a great discrepancy in the sizes of allocations
+(some are huge and others tiny) the arena may waste quite a bit of memory. One
+very easy fix is to use more than one arena, each tuned to the kinds of allocations
+that it will be used for (this thought can be expanded to using one kind of allocator
+for each use case).
