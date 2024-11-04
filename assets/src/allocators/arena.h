@@ -1,6 +1,9 @@
+#include <assert.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 // Align up the given integer to the given alignment.
 #define ALIGN_TO(_value, _alignment)                                           \
@@ -17,7 +20,7 @@ typedef struct arena {
   arena_block_t *blocks;
 } arena_t;
 
-#define ARENA_BLOCK_SIZE 1024
+#define ARENA_BLOCK_SIZE 4096
 
 static inline void arena_block_init(arena_block_t *b, arena_block_t *next) {
   b->next = next;
@@ -39,8 +42,10 @@ static void *arena_block_alloc(arena_block_t *b, size_t size, size_t align) {
 }
 
 static arena_block_t *arena_new_block(arena_t *a) {
-  arena_block_t *blk = malloc(ARENA_BLOCK_SIZE);
-  if (!blk) return NULL;
+  arena_block_t *blk = mmap(NULL, ARENA_BLOCK_SIZE, PROT_READ | PROT_WRITE,
+                            MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+  if (blk == MAP_FAILED)
+    return NULL;
 
   // initialize the block and prepend to the linked list
   arena_block_init(blk, a->blocks);
@@ -74,7 +79,7 @@ static void arena_clear(arena_t *a) {
   arena_block_t *b = a->blocks;
   while (b) {
     arena_block_t *next = b->next;
-    free(b);
+    munmap(b, ARENA_BLOCK_SIZE);
     b = next;
   }
 

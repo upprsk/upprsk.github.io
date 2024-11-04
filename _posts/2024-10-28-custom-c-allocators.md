@@ -516,3 +516,211 @@ This shows that when there is a great discrepancy in the sizes of allocations
 very easy fix is to use more than one arena, each tuned to the kinds of allocations
 that it will be used for (this thought can be expanded to using one kind of allocator
 for each use case).
+
+### Optimizing the arena
+
+Our arena is great, but there is one very big problem with it: it still uses `malloc`.
+The blocks our arena uses are fixed size, but we go through all the functionality
+and complexity of libc to get it. One way to fix this is to go directly to the OS
+and map full pages at a time. On Linux, we have a syscall exactly for that: `mmap`.
+
+From the man pages, it's signature is:
+
+```c
+void *mmap(void *addr, size_t len, int prot, int flags, int fildes, off_t off);
+```
+
+`mmap` can do a lot of things, but for our purposes all that we need is the
+ability to allocate a full page of memory directly from the kernel. Now what is
+the page size? Or even better, what is a page?
+
+The operating system maps the physical memory of the computer into virtual memory.
+This is what allows magic such as hibernation, swap memory and, perhaps more
+critically, _process isolation_. Details and technicalities aside, a page is the
+minimum amount of memory that can be mapped by a process, and as such, the minimum
+that we will actually consume when requesting memory from the kernel. If we want
+our blocks to have the minimum amount of overhead as possible, they should have
+the same size as a page.
+
+So, what is the page size? On most processors (virtual memory is implemented in
+hardware) pages are 4 KiB, or 4096 bytes. Why? I will leave the research to you
+(check [this][so-50033983] SO answer for some history). The fact is, there is
+a POSIX function that we can call to get the exact size in our system:
+
+```c
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void) {
+  long page_size = sysconf(_SC_PAGESIZE);
+
+  printf("page_size=%ld", page_size);
+  // stdout: page_size=4096
+}
+```
+
+OK, we have the `len` parameter figured out. What about the rest? `addr` is the
+desired start address for the memory region, we can pass `NULL` because we don't
+care. `prot` allows us to select what do we have permission to do with the data,
+in this case we want `PROT_READ | PROT_WRITE`. `flags` is for configuring the
+allocation, for our purposes, this will be `MAP_ANONYMOUS`, which means that the
+allocation is not backed by a file, and `MAP_PRIVATE` because only the current
+process should see it. `fildes` is the backing file descriptor when mapping a
+file, which we are not doing, so we set this to -1. `off` is the offset from
+which to start mapping, that we don't care about, so 0.
+
+In the end, to allocate a page for our arena we do:
+
+```c
+#define ARENA_BLOCK_SIZE 4096
+
+arena_block_t *blk = mmap(NULL, ARENA_BLOCK_SIZE, PROT_READ | PROT_WRITE,
+                          MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+if (blk == MAP_FAILED)
+  return NULL;
+```
+
+And later, don't forget, we need to free each page. We can do that by calling
+`mumap` on each one:
+
+```c
+munmap(b, ARENA_BLOCK_SIZE);
+```
+
+And that is all that was needed to get rid of `malloc`!
+
+## Block Allocators
+
+The linear allocators are fine, but sometimes you want more control over when
+memory gets freed. Going back to our HTTP server example, there is a lot of data
+that we can free all at once at the end of the request lifecycle, that is the
+perfect use-case for an arena. There is, however, data that can't be allocated
+inside the arena, the `arena_t` itself is one of them!
+
+In our fictitious HTTP server, each request has a control struct with the socket,
+origin address, an arena for temporary allocations and some more metadata. This
+struct is allocated and freed very frequently, so we want this operation to be
+fast. Considering that all allocations will always have the same size, this is
+the perfect candidate for using a **pool** or **block allocator**.
+
+This allocator allows fixed sized blocks to be allocated and freed in constant
+time. The disadvantage: there will be a predefined limit on the number of blocks.
+If we decide that we want 50 blocks, that is the maximum that we will get at any
+point.
+
+![Block allocator](/assets/images/block_allocator_2.jpg)
+
+When the allocator is initialized we give it a buffer (just like the FBA), and
+then partition it based on the element size. Each block is initialized to have
+a pointer to the next one in the chain, so that we have a linked list.
+
+When an allocation request arrives, we remove the first item in the list and
+return it to the user. This way our list only holds allocated items.
+
+![Block allocator after one allocation](/assets/images/block_allocator_3.jpg)
+
+When the block is allocated there is no need to track it, the user should free
+it at some point, then we get it back. This means that we can reuse the space
+where the `next` pointer is when we return the block to the user. No wasted space!
+
+When it is time to free the block, we simply add it back to the list. This is
+where we could stop, but I also decided to add pointers to the start and end of
+the buffer for safety. With this extra data it is possible to validate that the
+pointer given to `free` is indeed managed by the block allocator (i.e. it is
+contained in the backing buffer). In the example, we free the second block:
+
+![Block allocator after free](/assets/images/block_allocator_4.jpg)
+
+One thing you might notice is that (although not in this example) the blocks lose
+their ordering very quickly. This is not a problem, as we still just return the
+first one in the list. If anything, this makes it faster, as the returned block is
+the most recently used one.
+
+Now onto some code:
+
+```c
+#include <assert.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <string.h>
+
+typedef struct block_allocator_block {
+  struct block_allocator_block *next;
+} block_allocator_block_t;
+
+typedef struct block_allocator {
+  uint8_t *buffer;
+  uint8_t *buffer_end;
+  block_allocator_block_t *blocks;
+} block_allocator_t;
+
+static void ba_init(block_allocator_t *ba, uint8_t *buffer, size_t buffer_size,
+                    size_t item_size) {
+  assert(item_size >= sizeof(block_allocator_block_t));
+  size_t item_count = buffer_size / item_size;
+
+  // initialize all of the blocks, this creates a linked list of free blocks
+  block_allocator_block_t *prev = NULL;
+  for (size_t i = 0; i < item_count; i++) {
+    block_allocator_block_t *b =
+        (block_allocator_block_t *)(buffer + i * item_size);
+    *b = (block_allocator_block_t){.next = prev};
+
+    prev = b;
+  }
+
+  ba->buffer = buffer;
+  ba->buffer_end = buffer + buffer_size;
+  ba->blocks = prev;
+}
+
+static void *ba_alloc(block_allocator_t *ba) {
+  if (!ba->blocks)
+    return NULL;
+
+  block_allocator_block_t *blk = ba->blocks;
+  ba->blocks = blk->next;
+
+  // clear at least the reference to the next block before returning
+  memset(blk, 0, sizeof(block_allocator_block_t));
+  return blk;
+}
+
+static void ba_free(block_allocator_t *ba, void *ptr) {
+  uint8_t *p = ptr;
+
+  // don't put in our list pointers that are not in our buffer
+  if (p < ba->buffer || p > ba->buffer_end)
+    return;
+
+  block_allocator_block_t *blk = ptr;
+  *blk = (block_allocator_block_t){.next = ba->blocks};
+  ba->blocks = blk;
+}
+```
+
+It is a direct translation of what was explained above. The `ba_alloc` function
+pops the first item of the list and the `ba_free` function puts it back (ignoring
+any pointer that has not originated from our buffer). This allocator also has the
+same characteristics of the ones before (FBA and arena), it is possible to free
+all allocations at once:
+
+```c
+// the block allocator does not store the size of the items, so we need to pass
+// it on the reset.
+ba_reset(ba, ba->buffer, ba->buffer_end - ba->buffer, item_size);
+```
+
+One thing you might also notice that the block allocator can be extended in much
+the same way as our fixed buffer allocator. By moving the buffer management into
+the allocator, we get the ability to allocate more on demand. That, however, I will
+leave as an exercise to the reader.
+
+## Conclusion
+
+I hope that this post opens your eyes to the world of allocators, and how it changes
+our perspective on memory management. There are other types of allocators (oh, there
+are so many more), but this was an introduction to the ones that might help the most
+to have in your tool belt.
+
+[so-50033983]: https://stackoverflow.com/a/50033983
